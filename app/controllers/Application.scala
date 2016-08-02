@@ -6,6 +6,7 @@ import javax.inject.Inject
 
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
+import scala.math.signum
 
 import play.api.Logger
 import play.api.i18n.MessagesApi
@@ -14,12 +15,13 @@ import play.api.data.Form
 import play.api.data.Forms.{ date, ignored, mapping, nonEmptyText }
 import play.api.libs.concurrent.Execution.Implicits.defaultContext
 import play.api.libs.json.Json, Json.toJsFieldJsValueWrapper
+import play.api.Play.current
 
 import play.modules.reactivemongo.{
   MongoController, ReactiveMongoApi, ReactiveMongoComponents
 }
 import reactivemongo.play.json._, collection.JSONCollection
-
+import reactivemongo.api.QueryOpts
 import reactivemongo.bson.BSONObjectID
 
 import models.{ Employee, JsonFormats, Page }, JsonFormats.employeeFormat
@@ -48,6 +50,8 @@ class Application @Inject() (
     extends Controller with MongoController with ReactiveMongoComponents {
 
   implicit val timeout = 10.seconds
+
+  lazy val config = current.configuration
 
   /**
    * Describe the employee form (used in both edit and create screens).
@@ -100,14 +104,25 @@ class Application @Inject() (
       if (filter.length > 0) Json.obj("name" -> filter)
       else Json.obj()
     }
-    val filtered = collection.flatMap(
-      _.find(mongoFilter).cursor[Employee]().collect[List]())
+    val sortFilter = orderBy match {
+      case 2|(-2) => Json.obj("name" -> signum(orderBy))
+      case 3|(-3) => Json.obj("address" -> signum(orderBy))
+      case 4|(-4) => Json.obj("dob" -> signum(orderBy))
+      case 5|(-5) => Json.obj("joiningDate" -> signum(orderBy))
+      case _ => Json.obj("designation" -> signum(orderBy))
+    }
 
-    filtered.map({ employees =>
+    val pageSize = config.getInt("page.size").filter(_ > 0).getOrElse(20)
+    val offset = page * pageSize
+    val futureTotal = collection.flatMap(_.count(Some(mongoFilter)))
+    val filtered = collection.flatMap(
+      _.find(mongoFilter).options(QueryOpts(skipN = page * pageSize)).sort(sortFilter).cursor[Employee]().collect[List](pageSize))
+
+    futureTotal.zip(filtered).map { case (total, employees) => {
       implicit val msg = messagesApi.preferred(request)
 
-      Ok(html.list(Page(employees, 0, 10, 20), orderBy, filter))
-    }).recover {
+      Ok(html.list(Page(employees, page, offset, total), orderBy, filter))
+    }}.recover {
       case t: TimeoutException =>
         Logger.error("Problem found in employee list process")
         InternalServerError(t.getMessage)
